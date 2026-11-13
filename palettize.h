@@ -33,6 +33,9 @@ int palettize_generate_palette_xbgr32( PALETTIZE_U32 const* xbgr, int width, int
 void palettize_remap_xbgr32( PALETTIZE_U32 const* xbgr, int width, int height, 
     PALETTIZE_U32 const* palette, int palette_size, PALETTIZE_U8* output );
 
+void palettize_remap_xbgr32_dithered( PALETTIZE_U32 const* xbgr, int width, int height,
+    PALETTIZE_U32 const* palette, int palette_size, int strength, PALETTIZE_U8* output );
+
 
 int palettize_generate_palette_rgb16( PALETTIZE_U16 const* rgb, int width, int height, 
     PALETTIZE_U16* palette, int palette_size, void* memctx );
@@ -117,6 +120,11 @@ An example which loads a bitmap, generate a palette from it, and remap the image
 
 
 typedef struct palettize_internal_rgb_t { PALETTIZE_U8 rgb[ 3 ]; } palettize_internal_rgb_t;
+
+#ifndef PALDITHER_ASSERT
+    #include <assert.h>
+    #define PALDITHER_ASSERT( expression, message ) assert( ( expression ) && ( message ) )
+#endif
 
 
 typedef struct palettize_internal_bucket_t
@@ -439,6 +447,110 @@ void palettize_remap_xbgr32( PALETTIZE_U32 const* xbgr, int width, int height,
 			*output++ = (PALETTIZE_U8) best_index;
             }
         }
+    }
+
+
+static int palettize_internal_div16_round( int value )
+    {
+    return value >= 0 ? ( value + 8 ) / 16 : - ( ( 8 - value ) / 16 );
+    }
+
+
+void palettize_remap_xbgr32_dithered( PALETTIZE_U32 const* xbgr, int width, int height,
+    PALETTIZE_U32 const* palette, int palette_size, int strength, PALETTIZE_U8* output )
+    {
+    if( strength < 0 ) strength = 0;
+    if( strength > 100 ) strength = 100;
+    if( strength == 0 )
+        {
+        palettize_remap_xbgr32( xbgr, width, height, palette, palette_size, output );
+        return;
+        }
+
+    int* error = (int*) PALETTIZE_MALLOC( 0, sizeof( int ) * 3 * width * 2 );
+    int* current_error = error;
+    int* next_error = error + 3 * width;
+    for( int x = 0; x < 3 * width; ++x ) current_error[ x ] = 0;
+
+    for( int y = 0; y < height; ++y )
+        {
+        for( int x = 0; x < 3 * width; ++x ) next_error[ x ] = 0;
+        for( int x = 0; x < width; ++x )
+            {
+            PALETTIZE_U32 color = xbgr[ y * width + x ];
+            int source_r = (int) ( color & 0x000000ff );
+            int source_g = (int) ( ( color & 0x0000ff00 ) >> 8 );
+            int source_b = (int) ( ( color & 0x00ff0000 ) >> 16 );
+
+            int adjusted_r = source_r + palettize_internal_div16_round( current_error[ 3 * x + 0 ] );
+            int adjusted_g = source_g + palettize_internal_div16_round( current_error[ 3 * x + 1 ] );
+            int adjusted_b = source_b + palettize_internal_div16_round( current_error[ 3 * x + 2 ] );
+            if( adjusted_r < 0 ) adjusted_r = 0; else if( adjusted_r > 255 ) adjusted_r = 255;
+            if( adjusted_g < 0 ) adjusted_g = 0; else if( adjusted_g > 255 ) adjusted_g = 255;
+            if( adjusted_b < 0 ) adjusted_b = 0; else if( adjusted_b > 255 ) adjusted_b = 255;
+
+            int best_index = 0;
+            int mindist_sq = 255 * 255 + 255 * 255 + 255 * 255 + 1;
+            for( int i = 0; i < palette_size; ++i )
+                {
+                int pr = (int) ( palette[ i ] & 0x000000ff );
+                int pg = (int) ( ( palette[ i ] & 0x0000ff00 ) >> 8 );
+                int pb = (int) ( ( palette[ i ] & 0x00ff0000 ) >> 16 );
+                int dr = adjusted_r - pr;
+                int dg = adjusted_g - pg;
+                int db = adjusted_b - pb;
+                int dist_sq = dr * dr + dg * dg + db * db;
+                if( dist_sq < mindist_sq ) { mindist_sq = dist_sq; best_index = i; }
+                }
+            output[ y * width + x ] = (PALETTIZE_U8) best_index;
+
+            int chosen_r = (int) ( palette[ best_index ] & 0x000000ff );
+            int chosen_g = (int) ( ( palette[ best_index ] & 0x0000ff00 ) >> 8 );
+            int chosen_b = (int) ( ( palette[ best_index ] & 0x00ff0000 ) >> 16 );
+            int diff_r = ( ( adjusted_r - chosen_r ) * strength ) / 100;
+            int diff_g = ( ( adjusted_g - chosen_g ) * strength ) / 100;
+            int diff_b = ( ( adjusted_b - chosen_b ) * strength ) / 100;
+
+            if( x + 1 < width )
+                current_error[ 3 * ( x + 1 ) + 0 ] += diff_r * 7;
+            if( y + 1 < height )
+                {
+                if( x > 0 )
+                    next_error[ 3 * ( x - 1 ) + 0 ] += diff_r * 3;
+                next_error[ 3 * x + 0 ] += diff_r * 5;
+                if( x + 1 < width )
+                    next_error[ 3 * ( x + 1 ) + 0 ] += diff_r;
+                }
+
+            if( x + 1 < width )
+                current_error[ 3 * ( x + 1 ) + 1 ] += diff_g * 7;
+            if( y + 1 < height )
+                {
+                if( x > 0 )
+                    next_error[ 3 * ( x - 1 ) + 1 ] += diff_g * 3;
+                next_error[ 3 * x + 1 ] += diff_g * 5;
+                if( x + 1 < width )
+                    next_error[ 3 * ( x + 1 ) + 1 ] += diff_g;
+                }
+
+            if( x + 1 < width )
+                current_error[ 3 * ( x + 1 ) + 2 ] += diff_b * 7;
+            if( y + 1 < height )
+                {
+                if( x > 0 )
+                    next_error[ 3 * ( x - 1 ) + 2 ] += diff_b * 3;
+                next_error[ 3 * x + 2 ] += diff_b * 5;
+                if( x + 1 < width )
+                    next_error[ 3 * ( x + 1 ) + 2 ] += diff_b;
+                }
+            }
+
+        int* swap = current_error;
+        current_error = next_error;
+        next_error = swap;
+        }
+
+    PALETTIZE_FREE( 0, error );
     }
 
 
