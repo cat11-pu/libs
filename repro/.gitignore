@@ -1,0 +1,21 @@
+# build outputs produced by run_all.sh and manual test runs
+*.o
+*.bin
+/suite
+/suite_c
+/suite_cpp
+/megafuzz
+/gen_visual
+/fuzz
+/fuzz_asan
+/repro
+/repro2
+/repro2_asan
+/min
+/catch
+/dbg
+/demo
+/ab/compare
+/ab/compare_nd
+/ab/oob
+/ab/oobnew
