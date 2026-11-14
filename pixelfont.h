@@ -13,6 +13,10 @@ If you want to generate pixelfonts through the pixelfont_builder api, do this:
     #define PIXELFONT_BUILDER_IMPLEMENTATION
 before include the file to create the implementation.
 
+If you want the anti-aliased subpixel-positioned renderer (pixelfont_blit_subpixel), do this:
+    #define PIXELFONT_SUBPIXEL_IMPLEMENTATION
+before you include this file in *one* C/C++ file to create the implementation.
+
 */
 
 #ifndef pixelfont_h
@@ -76,6 +80,15 @@ typedef struct pixelfont_bounds_t
     int height;
     } pixelfont_bounds_t;
 
+
+/* Subpixel renderer. Same layout as pixelfont_blit, but the pen position, `hspacing` and kerning
+   adjustments are tracked in 16.16 fixed-point pixels, and glyph edges are anti-aliased horizontally
+   by coverage-blending into a grayscale (PIXELFONT_U8) target. This keeps letter spacing even at
+   small sizes, where rounding advances to whole pixels causes uneven gaps and touching strokes.
+   `x` and `hspacing` are 16.16 fixed-point (use 65536 for one pixel). `y` and `vspacing` are whole
+   pixels, as rows are always pixel aligned. Supports '\n' line breaks; no word wrap or alignment. */
+void pixelfont_blit_subpixel( pixelfont_t const* font, int x, int y, char const* text, PIXELFONT_U8 color,
+    PIXELFONT_U8* target, int width, int height, int hspacing, int vspacing, pixelfont_bounds_t* bounds );
 
 
 typedef struct pixelfont_builder_t pixelfont_builder_t;
@@ -238,6 +251,87 @@ void PIXELFONT_FUNC_NAME( pixelfont_t const* font, int x, int y, char const* tex
 #undef PIXELFONT_FUNC_NAME
 
 #endif /* PIXELFONT_IMPLEMENTATION */
+
+
+
+#ifdef PIXELFONT_SUBPIXEL_IMPLEMENTATION
+#undef PIXELFONT_SUBPIXEL_IMPLEMENTATION
+
+#ifndef PIXELFONT_SUBPIXEL_BLEND
+    #define PIXELFONT_SUBPIXEL_BLEND( dst, coverage, color ) \
+        *(dst) = (PIXELFONT_U8)( *(dst) + ( ( ( (int)(color) - (int)*(dst) ) * (int)(coverage) + 127 ) / 255 ) )
+#endif
+
+void pixelfont_blit_subpixel( pixelfont_t const* font, int x, int y, char const* text, PIXELFONT_U8 color,
+    PIXELFONT_U8* target, int width, int height, int hspacing, int vspacing, pixelfont_bounds_t* bounds )
+    {
+    int const x0 = x;
+    int const y0 = y;
+    int max_x = x;
+    char const* str = text;
+    while( *str )
+        {
+        if( *str == '\n' )
+            {
+            max_x = x > max_x ? x : max_x;
+            x = x0;
+            y += font->line_spacing + vspacing;
+            ++str;
+            continue;
+            }
+
+        PIXELFONT_U8 const* g = font->glyphs + font->offsets[ (int) (PIXELFONT_U8) *str ];
+        int lead = (PIXELFONT_I8) *g++;
+        int w = *g++;
+        int h = font->height;
+        PIXELFONT_U8 const* bits = g;
+        g += h * w;
+
+        x += lead << 16;
+        if( target && w > 0 )
+            {
+            int px = x >> 16;
+            int frac = ( x >> 8 ) & 0xff;
+            for( int iy = 0; iy < h; ++iy )
+                {
+                int ty = y + iy;
+                if( ty < 0 || ty >= height ) continue;
+                for( int ix = 0; ix < w; ++ix )
+                    {
+                    int p = bits[ ix + iy * w ];
+                    if( p )
+                        {
+                        int tx = px + ix;
+                        int coverage_l = ( p * ( 256 - frac ) ) >> 8;
+                        int coverage_r = ( p * frac ) >> 8;
+                        if( coverage_l && tx >= 0 && tx < width )
+                            PIXELFONT_SUBPIXEL_BLEND( &target[ tx + ty * width ], coverage_l, color );
+                        if( coverage_r && tx + 1 >= 0 && tx + 1 < width )
+                            PIXELFONT_SUBPIXEL_BLEND( &target[ tx + 1 + ty * width ], coverage_r, color );
+                        }
+                    }
+                }
+            }
+
+        x += ( (PIXELFONT_I8) *g++ ) << 16;
+        x += hspacing;
+        ++str;
+
+        int kern = *g++;
+        for( int k = 0; k < kern; ++k )
+            if( *g++ == (PIXELFONT_U8) *str ) { x += ( (PIXELFONT_I8) *g++ ) << 16; break; } else ++g;
+        }
+
+    max_x = x > max_x ? x : max_x;
+    if( bounds )
+        {
+        bounds->width = ( max_x - x0 + 0xffff ) >> 16;
+        bounds->height = ( y - y0 ) + font->height;
+        }
+    }
+
+
+#endif /* PIXELFONT_SUBPIXEL_IMPLEMENTATION */
 
 
 
